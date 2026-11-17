@@ -5,9 +5,13 @@
 #include <math.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#include <curl/curl.h>
 
 #include "scssdk_telemetry.h"
 #include "common/scssdk_telemetry_common_configs.h"
@@ -19,7 +23,7 @@
 
 #define UNUSED(x)
 
-static const char *const VIRTUALTRUCK_VERSION = "2.0.0";
+static const char *const VIRTUALTRUCK_VERSION = "3.0.0";
 static const time_t TRACE_INTERVAL_S = 5;
 
 static std::string data_dir;
@@ -499,6 +503,293 @@ SCSAPI_VOID telemetry_store_optional_float(const scs_string_t UNUSED(name), cons
 	}
 }
 
+// Upload to the server; the jsonl files are the queue, the server tells the number of the last line it has.
+
+static const int UPLOAD_INTERVAL_S = 10;
+static const size_t UPLOAD_MAX_LINES = 1000;
+
+struct upload_file_t
+{
+	const char *name;
+	// -1 until the server has told it.
+	long last_seq;
+	// Byte offsets of line last_seq and of the line after it, -1 until found.
+	long last_line_offset;
+	long offset;
+	// Line last_seq is sent once more after finding it, so the server checks the file is the one its lines are from.
+	bool verified;
+	bool stopped;
+};
+
+static std::string base_dir;
+static std::string game_id;
+static std::string server_url;
+static std::string server_token;
+static upload_file_t upload_files[] = {{"events", -1, -1, -1, false, false}, {"trace", -1, -1, -1, false, false}};
+// Heap thread and atomic flag: unload() may run after the static destructors.
+static std::thread *uploader = NULL;
+static std::atomic<bool> uploader_stop(false);
+// Only the uploader thread uses these.
+static CURL *curl = NULL;
+static bool upload_failing = false;
+
+static void upload_log(const std::string &message)
+{
+	FILE *const file = fopen((base_dir + "/upload.log").c_str(), "a");
+	if (! file) {
+		return;
+	}
+	char stamp[32];
+	const time_t now = time(NULL);
+	struct tm local;
+	strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", localtime_r(&now, &local));
+	fprintf(file, "%s %s: %s\n", stamp, game_id.c_str(), message.c_str());
+	fclose(file);
+}
+
+// Without both url and token the plugin only writes the files.
+static bool read_config(void)
+{
+	FILE *const file = fopen((base_dir + "/config").c_str(), "r");
+	if (! file) {
+		return false;
+	}
+	char buffer[1024];
+	while (fgets(buffer, sizeof(buffer), file)) {
+		std::string line(buffer);
+		while (! line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) {
+			line.pop_back();
+		}
+		const size_t equals = line.find('=');
+		if (equals == std::string::npos) {
+			continue;
+		}
+		const std::string key = line.substr(0, equals);
+		const std::string value = line.substr(equals + 1);
+		if (key == "url") {
+			server_url = value;
+			while (! server_url.empty() && server_url.back() == '/') {
+				server_url.pop_back();
+			}
+		}
+		else if (key == "token") {
+			server_token = value;
+		}
+	}
+	fclose(file);
+	return ! server_url.empty() && ! server_token.empty();
+}
+
+static size_t append_response(char *const data, const size_t size, const size_t count, void *const response)
+{
+	static_cast<std::string *>(response)->append(data, size * count);
+	return size * count;
+}
+
+// Aborts a running request when the game shuts down.
+static int abort_on_stop(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
+{
+	return uploader_stop ? 1 : 0;
+}
+
+// HTTP status, 0 when the server is unreachable.
+static long http_request(const upload_file_t &file, const std::string *const body, std::string &response)
+{
+	// Reset keeps the open connection for the next request.
+	curl_easy_reset(curl);
+	const std::string url = server_url + "/api/ingest/" + game_id + "/" + file.name;
+	const std::string authorization = "Authorization: Bearer " + server_token;
+	struct curl_slist *headers = curl_slist_append(NULL, authorization.c_str());
+	headers = curl_slist_append(headers, "Accept: application/json");
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, abort_on_stop);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	if (body) {
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body->c_str());
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body->size()));
+	}
+	long status = 0;
+	if (curl_easy_perform(curl) == CURLE_OK) {
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+	}
+	curl_slist_free_all(headers);
+	return status;
+}
+
+static long response_last_seq(const std::string &response)
+{
+	const size_t at = response.find("\"last_seq\":");
+	return at == std::string::npos ? -1 : strtol(response.c_str() + at + 11, NULL, 10);
+}
+
+// Logs only the first of repeated failures (e.g. the server is off for the whole drive).
+static void upload_failed(const upload_file_t &file, const long status, const std::string &response)
+{
+	if (! upload_failing) {
+		upload_log(std::string(file.name) + ": server unreachable or failing (HTTP " + std::to_string(status) + ") " + response.substr(0, 300) + "; retrying");
+		upload_failing = true;
+	}
+}
+
+static void upload_stopped(upload_file_t &file, const std::string &reason)
+{
+	upload_log(std::string(file.name) + ": " + reason + "; uploading stopped until the next start of the game");
+	file.stopped = true;
+}
+
+// Finds the byte offsets of line last_seq; false when the file has fewer lines than the server.
+static bool find_last_line(upload_file_t &file, FILE *const input)
+{
+	char *line = NULL;
+	size_t capacity = 0;
+	ssize_t length;
+	long seq = 0;
+	long line_offset = 0;
+	long offset = 0;
+	fseek(input, 0, SEEK_SET);
+	while (seq < file.last_seq && (length = getline(&line, &capacity, input)) > 0 && line[length - 1] == '\n') {
+		line_offset = offset;
+		offset += length;
+		seq++;
+	}
+	free(line);
+	if (seq < file.last_seq) {
+		upload_stopped(file, "the server has " + std::to_string(file.last_seq) + " lines, the file only " + std::to_string(seq));
+		return false;
+	}
+	file.last_line_offset = line_offset;
+	file.offset = offset;
+	file.verified = file.last_seq == 0;
+	return true;
+}
+
+// Sends the lines after last_seq that end before limit (-1 = the whole file); true when all of them are on the server.
+static bool upload_file(upload_file_t &file, const long limit)
+{
+	if (file.stopped) {
+		return false;
+	}
+	std::string response;
+	if (file.last_seq < 0) {
+		const long status = http_request(file, NULL, response);
+		const long last_seq = response_last_seq(response);
+		if (status != 200 || last_seq < 0) {
+			if (status == 0 || status >= 500) {
+				upload_failed(file, status, response);
+			}
+			else {
+				upload_stopped(file, "the server refused (HTTP " + std::to_string(status) + ") " + response.substr(0, 300));
+			}
+			return false;
+		}
+		file.last_seq = last_seq;
+		file.offset = -1;
+	}
+	FILE *const input = fopen((data_dir + "/" + file.name + ".jsonl").c_str(), "r");
+	if (! input) {
+		return file.last_seq == 0;
+	}
+	if (file.offset < 0 && ! find_last_line(file, input)) {
+		fclose(input);
+		return false;
+	}
+	char *line = NULL;
+	size_t capacity = 0;
+	ssize_t length;
+	bool done = false;
+	while (! uploader_stop) {
+		const long start = file.verified ? file.offset : file.last_line_offset;
+		const long first_seq = file.verified ? file.last_seq + 1 : file.last_seq;
+		fseek(input, start, SEEK_SET);
+		std::string body = "{\"seq\":" + std::to_string(first_seq) + ",\"lines\":[";
+		size_t count = 0;
+		long end = start;
+		long last_line = start;
+		while (count < UPLOAD_MAX_LINES && (length = getline(&line, &capacity, input)) > 0 && line[length - 1] == '\n'
+			&& (limit < 0 || end + length <= limit)) {
+			body += (count ? "," : "") + std::string(line, length - 1);
+			last_line = end;
+			end += length;
+			count++;
+		}
+		if (count == 0) {
+			done = true;
+			break;
+		}
+		body += "]}";
+		response.clear();
+		const long status = http_request(file, &body, response);
+		if (status == 200) {
+			if (upload_failing) {
+				upload_log(std::string(file.name) + ": uploading again");
+				upload_failing = false;
+			}
+			file.last_seq = first_seq + static_cast<long>(count) - 1;
+			file.last_line_offset = last_line;
+			file.offset = end;
+			file.verified = true;
+		}
+		else if (status == 409 && response_last_seq(response) >= 0 && response_last_seq(response) < file.last_seq) {
+			// The server has fewer lines than before; send them again from its last one.
+			upload_log(std::string(file.name) + ": the server has " + std::to_string(response_last_seq(response)) + " lines instead of " + std::to_string(file.last_seq) + ", sending again");
+			file.last_seq = response_last_seq(response);
+			if (! find_last_line(file, input)) {
+				break;
+			}
+		}
+		else if (status == 0 || status >= 500) {
+			// The lines may have arrived; resending them is safe, the server skips equal lines.
+			upload_failed(file, status, response);
+			break;
+		}
+		else {
+			upload_stopped(file, "the server refused the lines (HTTP " + std::to_string(status) + ") " + response.substr(0, 300));
+			break;
+		}
+	}
+	free(line);
+	fclose(input);
+	return done;
+}
+
+static void upload_loop(void)
+{
+	curl = curl_easy_init();
+	while (curl && ! uploader_stop) {
+		// Trace written so far: the events before it go first, so a trace point never comes before the truck or job change preceding it.
+		struct stat trace;
+		const long trace_end = stat((data_dir + "/trace.jsonl").c_str(), &trace) == 0 ? static_cast<long>(trace.st_size) : 0;
+		if (upload_file(upload_files[0], -1) && ! uploader_stop) {
+			upload_file(upload_files[1], trace_end);
+		}
+		for (int i = 0; i < UPLOAD_INTERVAL_S * 10 && ! uploader_stop; i++) {
+			usleep(100000);
+		}
+	}
+	if (curl) {
+		curl_easy_cleanup(curl);
+		curl = NULL;
+	}
+}
+
+static void stop_uploader(void)
+{
+	if (! uploader) {
+		return;
+	}
+	uploader_stop = true;
+	uploader->join();
+	delete uploader;
+	uploader = NULL;
+}
+
 // Plugin lifecycle.
 
 static FILE *open_output(const std::string &dir, const char *const file_name)
@@ -525,10 +816,18 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 	}
 	const scs_telemetry_init_params_v101_t *const version_params = static_cast<const scs_telemetry_init_params_v101_t *>(params);
 
+	const char *const home = getenv("HOME");
+	if (! home) {
+		version_params->common.log(SCS_LOG_TYPE_error, "virtualtruck: HOME is not set");
+		return SCS_RESULT_generic_error;
+	}
+	base_dir = std::string(home) + "/Library/Application Support/virtualtruck";
+	game_id = version_params->common.game_id;
 	// One directory per game (ats, eut2), so that a job of one game cannot take over the state of the other.
-	data_dir = std::string(VIRTUALTRUCK_DATA_DIR) + "/" + version_params->common.game_id;
+	data_dir = base_dir + "/data/" + game_id;
 	const std::string &dir = data_dir;
-	mkdir(VIRTUALTRUCK_DATA_DIR, 0755);
+	mkdir(base_dir.c_str(), 0755);
+	mkdir((base_dir + "/data").c_str(), 0755);
 	mkdir(dir.c_str(), 0755);
 	events_file = open_output(dir, "events.jsonl");
 	trace_file = open_output(dir, "trace.jsonl");
@@ -580,15 +879,40 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 	}
 	write_line(events_file, "start", ",\"version\":\"" + std::string(VIRTUALTRUCK_VERSION) + "\"");
 	version_params->common.log(SCS_LOG_TYPE_message, ("virtualtruck " + std::string(VIRTUALTRUCK_VERSION) + ": writing to " + dir).c_str());
+
+	server_url.clear();
+	server_token.clear();
+	if (read_config()) {
+		for (upload_file_t &file : upload_files) {
+			file.last_seq = -1;
+			file.last_line_offset = -1;
+			file.offset = -1;
+			file.verified = false;
+			file.stopped = false;
+		}
+		curl_global_init(CURL_GLOBAL_DEFAULT);
+		uploader_stop = false;
+		upload_failing = false;
+		uploader = new std::thread(upload_loop);
+		version_params->common.log(SCS_LOG_TYPE_message, ("virtualtruck: uploading to " + server_url).c_str());
+	}
+	else {
+		version_params->common.log(SCS_LOG_TYPE_message, ("virtualtruck: no url and token in " + base_dir + "/config, not uploading").c_str());
+	}
 	return SCS_RESULT_ok;
 }
 
 SCSAPI_VOID scs_telemetry_shutdown(void)
 {
+	if (uploader) {
+		stop_uploader();
+		curl_global_cleanup();
+	}
 	close_outputs();
 }
 
 void __attribute__ ((destructor)) unload(void)
 {
+	stop_uploader();
 	close_outputs();
 }
