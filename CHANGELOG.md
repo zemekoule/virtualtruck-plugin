@@ -1,6 +1,11 @@
-# Changelog – drivelog
+# Changelog – virtualtruck
 
-Verze se při startu hry zapisuje do `game.log.txt` (`drivelog 1.2.0: writing to …`) a do `data/events.jsonl` (řádek `start`).
+Verze se při startu hry zapisuje do `game.log.txt` (`virtualtruck 2.0.0: writing to …`, do verze 1.9.0 `drivelog …`) a do `data/events.jsonl` (řádek `start`).
+
+## 2.0.0 – 2026-11-17
+
+- Plugin přejmenovaný z `drivelog` na `virtualtruck`: soubor `virtualtruck.so`, prefix `virtualtruck` v `game.log.txt`. Starý `drivelog.so` je potřeba z adresáře `plugins` hry smazat, jinak poběží oba.
+- Data zapisuje do `data/` vedle repa (`virtualtruck/data/<hra>/`), formát se nemění.
 
 ## 1.9.0 – 2026-11-15
 

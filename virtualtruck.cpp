@@ -19,7 +19,7 @@
 
 #define UNUSED(x)
 
-static const char *const DRIVELOG_VERSION = "1.9.0";
+static const char *const VIRTUALTRUCK_VERSION = "2.0.0";
 static const time_t TRACE_INTERVAL_S = 5;
 
 static std::string data_dir;
@@ -526,15 +526,15 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 	const scs_telemetry_init_params_v101_t *const version_params = static_cast<const scs_telemetry_init_params_v101_t *>(params);
 
 	// One directory per game (ats, eut2), so that a job of one game cannot take over the state of the other.
-	data_dir = std::string(DRIVELOG_DATA_DIR) + "/" + version_params->common.game_id;
+	data_dir = std::string(VIRTUALTRUCK_DATA_DIR) + "/" + version_params->common.game_id;
 	const std::string &dir = data_dir;
-	mkdir(DRIVELOG_DATA_DIR, 0755);
+	mkdir(VIRTUALTRUCK_DATA_DIR, 0755);
 	mkdir(dir.c_str(), 0755);
 	events_file = open_output(dir, "events.jsonl");
 	trace_file = open_output(dir, "trace.jsonl");
 	if (! events_file || ! trace_file) {
 		close_outputs();
-		version_params->common.log(SCS_LOG_TYPE_error, ("drivelog: unable to open output files in " + dir).c_str());
+		version_params->common.log(SCS_LOG_TYPE_error, ("virtualtruck: unable to open output files in " + dir).c_str());
 		return SCS_RESULT_generic_error;
 	}
 
@@ -547,7 +547,7 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 	;
 	if (! events_registered) {
 		close_outputs();
-		version_params->common.log(SCS_LOG_TYPE_error, "drivelog: unable to register event callbacks");
+		version_params->common.log(SCS_LOG_TYPE_error, "virtualtruck: unable to register event callbacks");
 		return SCS_RESULT_generic_error;
 	}
 
@@ -578,8 +578,8 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 	for (std::string &trailer : last_trailers) {
 		trailer.clear();
 	}
-	write_line(events_file, "start", ",\"version\":\"" + std::string(DRIVELOG_VERSION) + "\"");
-	version_params->common.log(SCS_LOG_TYPE_message, ("drivelog " + std::string(DRIVELOG_VERSION) + ": writing to " + dir).c_str());
+	write_line(events_file, "start", ",\"version\":\"" + std::string(VIRTUALTRUCK_VERSION) + "\"");
+	version_params->common.log(SCS_LOG_TYPE_message, ("virtualtruck " + std::string(VIRTUALTRUCK_VERSION) + ": writing to " + dir).c_str());
 	return SCS_RESULT_ok;
 }
 
