@@ -48,6 +48,6 @@ Ukonči hru a spusť `make uninstall`. Data v `data/` zůstanou.
 
 Ukonči hru, pak `make install` (přeloží a přepíše). Za běhu hry jde plugin vyměnit i příkazem `sdk reload` v herní konzoli.
 
-## Licence SDK
+## Licence
 
-`scs_sdk_1_16/` je SCS Telemetry SDK 1.16, licence v `scs_sdk_1_16/sdk_license.txt`.
+MIT, viz `LICENSE`. `scs_sdk_1_16/` je SCS Telemetry SDK 1.16 s vlastní licencí v `scs_sdk_1_16/sdk_license.txt`.
